@@ -61,8 +61,9 @@ func NewReceiver(logger log.Logger, c *config.ReceiverConfig, t *template.Templa
 }
 
 // Notify manages JIRA issues based on alertmanager webhook notify message.
-func (r *Receiver) Notify(data *alertmanager.Data, hashJiraLabel bool, updateSummary bool, updateDescription bool, reopenTickets bool, maxDescriptionLength int) (bool, error) {
+func (r *Receiver) Notify(data *alertmanager.Data, hashJiraLabel bool, updateSummary bool, updateDescription bool, reopenTickets bool, maxDescriptionLength int, updatePriority bool) (bool, error) {
 	project, err := r.tmpl.Execute(r.conf.Project, data)
+	fmt.Println("PROJECT:", project)
 	if err != nil {
 		return false, errors.Wrap(err, "generate project from template")
 	}
@@ -70,6 +71,7 @@ func (r *Receiver) Notify(data *alertmanager.Data, hashJiraLabel bool, updateSum
 	issueGroupLabel := toGroupTicketLabel(data.GroupLabels, hashJiraLabel)
 
 	issue, retry, err := r.findIssueToReuse(project, issueGroupLabel)
+	fmt.Println("ISSUE:", issue)
 	if err != nil {
 		return retry, err
 	}
@@ -77,8 +79,15 @@ func (r *Receiver) Notify(data *alertmanager.Data, hashJiraLabel bool, updateSum
 	// We want up to date title no matter what.
 	// This allows reflecting current group state if desired by user e.g {{ len $.Alerts.Firing() }}
 	issueSummary, err := r.tmpl.Execute(r.conf.Summary, data)
+	fmt.Println("ISSUE_SUMMARY:", issueSummary)
 	if err != nil {
 		return false, errors.Wrap(err, "generate summary from template")
+	}
+
+	issuePriority, err := r.tmpl.Execute(r.conf.Priority, data)
+	fmt.Println("ISSUE_PRIORITY:", issuePriority)
+	if err != nil {
+		return false, errors.Wrap(err, "generate priority from template")
 	}
 
 	issueDesc, err := r.tmpl.Execute(r.conf.Description, data)
@@ -95,6 +104,8 @@ func (r *Receiver) Notify(data *alertmanager.Data, hashJiraLabel bool, updateSum
 
 		// Update summary if needed.
 		if updateSummary {
+			fmt.Println("UPDATE_SUMMARY:", updateSummary)
+			fmt.Println("ISSUE_FIELDS_SUMMARY:", issue.Fields.Summary)
 			if issue.Fields.Summary != issueSummary {
 				level.Debug(r.logger).Log("updateSummaryDisabled executing")
 				retry, err := r.updateSummary(issue.Key, issueSummary)
@@ -103,7 +114,7 @@ func (r *Receiver) Notify(data *alertmanager.Data, hashJiraLabel bool, updateSum
 				}
 			}
 		}
-
+		fmt.Println("After update summary")
 		if r.conf.UpdateInComment != nil && *r.conf.UpdateInComment {
 			numComments := 0
 			if issue.Fields.Comments != nil {
@@ -125,10 +136,22 @@ func (r *Receiver) Notify(data *alertmanager.Data, hashJiraLabel bool, updateSum
 			}
 		}
 
+		fmt.Println("After update in comments")
 		// update description if enabled. This has to be done after comment adding logic which needs to handle redundant commentary vs description case.
 		if updateDescription {
 			if issue.Fields.Description != issueDesc {
 				retry, err := r.updateDescription(issue.Key, issueDesc)
+				if err != nil {
+					return retry, err
+				}
+			}
+		}
+		
+		fmt.Println("ISSUE_FIELDS_PRIORITY:", issue.Fields.Priority)
+		if updatePriority && issue.Fields.Priority != nil {
+			if issue.Fields.Priority.Name != issuePriority {
+				level.Debug(r.logger).Log("msg", "updating priority", "key", issue.Key, "new_priority", issuePriority)
+				retry, err := r.updatePriority(issue.Key, issuePriority)
 				if err != nil {
 					return retry, err
 				}
@@ -178,11 +201,13 @@ func (r *Receiver) Notify(data *alertmanager.Data, hashJiraLabel bool, updateSum
 	level.Info(r.logger).Log("msg", "no recent matching issue found, creating new issue", "label", issueGroupLabel)
 
 	issueType, err := r.tmpl.Execute(r.conf.IssueType, data)
+	fmt.Println("ISSUE_TYPE:", issueType)
 	if err != nil {
 		return false, errors.Wrap(err, "render issue type")
 	}
 
 	staticLabels := r.conf.StaticLabels
+	fmt.Println("STATIC_LABELS:", staticLabels)
 
 	issue = &jira.Issue{
 		Fields: &jira.IssueFields{
@@ -196,11 +221,13 @@ func (r *Receiver) Notify(data *alertmanager.Data, hashJiraLabel bool, updateSum
 	}
 	if r.conf.Priority != "" {
 		issuePrio, err := r.tmpl.Execute(r.conf.Priority, data)
+		fmt.Println("ISSUE_PRIORITY_SECOND:", issuePrio)
 		if err != nil {
 			return false, errors.Wrap(err, "render issue priority")
 		}
 
 		issue.Fields.Priority = &jira.Priority{Name: issuePrio}
+		fmt.Println("ISSUE_FIELDS_PRIORITY_SECOND:", issue.Fields.Priority.Name)
 	}
 
 	if len(r.conf.Components) > 0 {
@@ -316,7 +343,7 @@ func (r *Receiver) search(projects []string, issueLabel string) (*jira.Issue, bo
 	projectList := "'" + strings.Join(projects, "', '") + "'"
 	query := fmt.Sprintf("project in(%s) and labels=%q order by resolutiondate desc", projectList, issueLabel)
 	options := &jira.SearchOptions{
-		Fields:     []string{"summary", "status", "resolution", "resolutiondate", "description", "comment"},
+		Fields:     []string{"summary", "priority", "status", "resolution", "resolutiondate", "description", "comment"},
 		MaxResults: 2,
 	}
 
@@ -475,4 +502,22 @@ func (r *Receiver) doTransition(issueKey string, transitionState string) (bool, 
 	}
 	return false, errors.Errorf("JIRA state %q does not exist or no transition possible for %s", transitionState, issueKey)
 
+}
+
+func (r *Receiver) updatePriority(issueKey string, priority string) (bool, error) {
+    level.Debug(r.logger).Log("msg", "updating issue with new priority", "key", issueKey, "priority", priority)
+	fmt.Println("Updating the issue")
+    issueUpdate := &jira.Issue{
+        Key: issueKey,
+        Fields: &jira.IssueFields{
+            Priority: &jira.Priority{Name: priority},
+        },
+    }
+    issue, resp, err := r.client.UpdateWithOptions(issueUpdate, nil)
+    if err != nil {
+        return handleJiraErrResponse("Issue.UpdateWithOptions", resp, err, r.logger)
+    }
+    level.Debug(r.logger).Log("msg", "issue priority updated", "key", issue.Key, "id", issue.ID)
+    fmt.Println("Issue Prio Updated")
+	return false, nil
 }
